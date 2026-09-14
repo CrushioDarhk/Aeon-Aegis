@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Production build artifacts
+dist/
+
+# Local environment variables
+.env
+*.env
+
+# Python caching (legacy)
+__pycache__/
+*.pyc
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Misplaced / temporary directories
+mkdir AeonAegis
+mkdir AeonAegis/
+mkdir AeonAegis/**
+[mM]kdir*AeonAegis*
