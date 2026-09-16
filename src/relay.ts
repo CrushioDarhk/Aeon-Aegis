@@ -8,17 +8,19 @@ import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { mplex } from '@libp2p/mplex';
 import type { Stream, Connection } from '@libp2p/interface';
+import { SecurityManager } from './security/rateLimiter.js';
 
 /**
  * ============================================================================
- * Aeon Aegis - Zero-Trust P2P Relay Node
+ * Aeon Aegis - Zero-Trust P2P Relay Node (Phase 2 Hardened)
  * ============================================================================
  * Architecture:
  * - Listens on TCP port 9090 via libp2p.
  * - Enforces mandatory Noise protocol cryptographic handshake (@chainsafe/libp2p-noise).
+ * - Intercepts incoming streams via SecurityManager (Token-Bucket & IP Ban-Lists).
  * - Strips remote client IP / multiaddr network identities to prevent origin correlation.
  * - Securely forwards payload over local loopback TCP socket to Mock Origin (127.0.0.1:8080).
- * - Exposes Express + WebSocket control plane on port 9091 for health & metrics.
+ * - Exposes Express + WebSocket control plane on port 9091 for health, metrics & security state.
  * - Emits structured JSON logs for auditability, telemetry, and observability.
  */
 
@@ -28,6 +30,14 @@ export const RELAY_CONTROL_PORT = parseInt(process.env.RELAY_CONTROL_PORT || '90
 export const ORIGIN_HOST = process.env.ORIGIN_HOST || '127.0.0.1';
 export const ORIGIN_PORT = parseInt(process.env.ORIGIN_PORT || '8080', 10);
 export const AEON_RELAY_PROTOCOL = '/aeon-aegis/relay/1.0.0';
+
+// Global Security Manager Instance
+export const security = new SecurityManager({
+  capacity: 50,         // Maximum stream burst per IP
+  refillRate: 5,        // Tokens restored per second
+  banThreshold: 0,      // Score floor triggering IP ban
+  banDurationMs: 900000 // 15-minute ban duration
+});
 
 // Structured logger
 export function logJSON(level: 'info' | 'warn' | 'error', event: string, data: Record<string, any> = {}) {
@@ -76,8 +86,6 @@ export function proxyStreamToOrigin(
   metrics.totalStreamsProxied++;
   const streamId = stream.id;
 
-  // Zero-trust boundary: Notice we deliberately DO NOT forward connection.remoteAddr
-  // or client PeerId to the backend origin. The origin only sees a connection from 127.0.0.1.
   logJSON('info', 'stream_proxy_initiated', {
     stream_id: streamId,
     active_connections: metrics.activeConnections,
@@ -86,9 +94,7 @@ export function proxyStreamToOrigin(
     action: 'metadata_stripped'
   });
 
-  // Open clean internal TCP socket to mock origin
   const originSocket = net.createConnection({ host: ORIGIN_HOST, port: ORIGIN_PORT });
-
   let streamClosed = false;
 
   const cleanup = () => {
@@ -110,7 +116,6 @@ export function proxyStreamToOrigin(
     });
   });
 
-  // Client -> Relay (Decrypted by Noise) -> Origin TCP Socket
   stream.addEventListener('message', (evt) => {
     try {
       const rawData: Uint8Array = evt.data instanceof Uint8Array ? evt.data : evt.data.subarray();
@@ -137,7 +142,6 @@ export function proxyStreamToOrigin(
     }
   });
 
-  // Origin TCP Socket -> Relay -> Client (Encrypted by Noise)
   originSocket.on('data', (data: Buffer) => {
     try {
       const bytesCount = data.byteLength;
@@ -149,7 +153,6 @@ export function proxyStreamToOrigin(
         active_connections: metrics.activeConnections
       });
 
-      // Send payload back over the Noise encrypted stream
       stream.send(new Uint8Array(data));
     } catch (err: any) {
       metrics.recentErrors++;
@@ -170,17 +173,12 @@ export function proxyStreamToOrigin(
     cleanup();
   });
 
-  originSocket.on('close', () => {
-    cleanup();
-  });
-
-  stream.addEventListener('close', () => {
-    cleanup();
-  });
+  originSocket.on('close', () => { cleanup(); });
+  stream.addEventListener('close', () => { cleanup(); });
 }
 
 /**
- * Initializes and starts the libp2p Relay Node.
+ * Initializes and starts the libp2p Relay Node with Security Enforcement.
  */
 export async function startRelayNode() {
   const node = await createLibp2p({
@@ -192,7 +190,6 @@ export async function startRelayNode() {
     streamMuxers: [yamux(), mplex()]
   });
 
-  // Connection-level tracking for Noise handshake measurement
   const connectionHandshakeStart = new Map<string, number>();
 
   node.addEventListener('connection:open', (event) => {
@@ -201,12 +198,10 @@ export async function startRelayNode() {
     metrics.activeConnections++;
     metrics.totalConnectionsHandled++;
 
-    // Calculate approximate Noise cryptographic negotiation duration
     const startTime = connectionHandshakeStart.get(conn.id) || now;
     const handshakeDurationMs = Math.max(1, now - startTime);
     metrics.handshakeDurationsMs.push(handshakeDurationMs);
 
-    // Keep bounded history of durations (last 500)
     if (metrics.handshakeDurationsMs.length > 500) {
       metrics.handshakeDurationsMs.shift();
     }
@@ -230,8 +225,30 @@ export async function startRelayNode() {
     });
   });
 
-  // Register zero-trust stream handler with high concurrent stream capacity
+  // Zero-trust stream handler with active SecurityManager rate limiting
   node.handle(AEON_RELAY_PROTOCOL, (stream, connection) => {
+    // Extract peer IP address from libp2p multiaddr connection
+    let remoteIP = '127.0.0.1';
+    try {
+      const nodeAddr = connection.remoteAddr.nodeAddress();
+      remoteIP = nodeAddr.address;
+    } catch {
+      remoteIP = connection.remoteAddr.toString().split('/')[2] || '127.0.0.1';
+    }
+
+    // Rate Limiting & Ban-list evaluation
+    const check = security.isAllowed(remoteIP);
+    if (!check.allowed) {
+      logJSON('warn', 'security_stream_blocked', {
+        stream_id: stream.id,
+        remote_ip: remoteIP,
+        reason: check.reason,
+        reputation_score: check.score
+      });
+      stream.close();
+      return;
+    }
+
     const durations = metrics.handshakeDurationsMs;
     const latestHandshake = durations.length > 0 ? durations[durations.length - 1] : 0;
     proxyStreamToOrigin(stream, connection, latestHandshake);
@@ -244,13 +261,12 @@ export async function startRelayNode() {
 }
 
 /**
- * Initializes Express and WebSocket control plane for local health checks and telemetry.
+ * Control plane for local health checks, security metrics, and telemetry.
  */
 export function startControlPlane(libp2pNode: any) {
   const app = express();
   app.use(express.json());
 
-  // Health endpoint
   app.get('/health', (_req, res) => {
     res.json({
       status: 'healthy',
@@ -260,7 +276,6 @@ export function startControlPlane(libp2pNode: any) {
     });
   });
 
-  // Metrics endpoint
   app.get('/metrics', (_req, res) => {
     const durations = metrics.handshakeDurationsMs;
     const avgHandshake = durations.length > 0
@@ -274,27 +289,25 @@ export function startControlPlane(libp2pNode: any) {
       total_bytes_in: metrics.totalBytesIn,
       total_bytes_out: metrics.totalBytesOut,
       avg_noise_handshake_ms: parseFloat(avgHandshake),
+      security: security.getMetrics(),
       peer_id: libp2pNode.peerId.toString(),
       listen_addresses: libp2pNode.getMultiaddrs().map((a: any) => a.toString())
     });
   });
 
   const server = http.createServer(app);
-
-  // WebSocket Server for live control / telemetry
   const wss = new WebSocketServer({ server, path: '/control/ws' });
 
   wss.on('connection', (ws: WebSocket) => {
     logJSON('info', 'control_ws_client_connected');
     
-    // Send initial snapshot
     ws.send(JSON.stringify({
       type: 'SNAPSHOT',
       metrics,
+      security: security.getMetrics(),
       timestamp: new Date().toISOString()
     }));
 
-    // Periodically stream metrics
     const interval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -302,6 +315,7 @@ export function startControlPlane(libp2pNode: any) {
           activeConnections: metrics.activeConnections,
           bytesIn: metrics.totalBytesIn,
           bytesOut: metrics.totalBytesOut,
+          security: security.getMetrics(),
           timestamp: new Date().toISOString()
         }));
       }
@@ -348,7 +362,6 @@ async function main() {
 
   const controlServer = startControlPlane(node);
 
-  // Graceful shutdown
   const shutdown = async () => {
     logJSON('info', 'relay_node_shutting_down');
     try {
@@ -364,7 +377,6 @@ async function main() {
   process.on('SIGTERM', shutdown);
 }
 
-// Auto-start when executed directly
 if (process.argv[1] && (process.argv[1].endsWith('relay.ts') || process.argv[1].endsWith('relay.js'))) {
   main().catch((err) => {
     logJSON('error', 'relay_node_fatal_error', {
