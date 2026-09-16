@@ -1,71 +1,85 @@
-export class SecurityManager {
-  constructor(options = {}) {
-    this.capacity = options.capacity || 100; // Maximum token capacity
-    this.refillRate = options.refillRate || 10; // Tokens added per second
-    this.banThreshold = options.banThreshold || 0; // Reputation score floor for banning
-    this.banDurationMs = options.banDurationMs || 15 * 60 * 1000; // 15-minute ban
+export interface SecurityManagerOptions {
+  capacity?: number;
+  refillRate?: number;
+  banThreshold?: number;
+  banDurationMs?: number;
+}
 
-    // Storage maps
-    this.buckets = new Map(); // ip -> { tokens, lastRefill }
-    this.reputation = new Map(); // ip -> { score, bannedUntil }
+export interface AllowedResult {
+  allowed: boolean;
+  reason?: string;
+  tokensRemaining?: number;
+  score: number;
+}
+
+export interface Bucket {
+  tokens: number;
+  lastRefill: number;
+}
+
+export interface Reputation {
+  score: number;
+  bannedUntil: number;
+}
+
+export class SecurityManager {
+  private capacity: number;
+  private refillRate: number;
+  private banThreshold: number;
+  private banDurationMs: number;
+  private buckets: Map<string, Bucket>;
+  private reputation: Map<string, Reputation>;
+
+  constructor(options: SecurityManagerOptions = {}) {
+    this.capacity = options.capacity || 100;
+    this.refillRate = options.refillRate || 10;
+    this.banThreshold = options.banThreshold || 0;
+    this.banDurationMs = options.banDurationMs || 15 * 60 * 1000;
+
+    this.buckets = new Map();
+    this.reputation = new Map();
   }
 
-  /**
-   * Evaluates whether an incoming IP connection is allowed.
-   */
-  isAllowed(ip) {
+  public isAllowed(ip: string): AllowedResult {
     const now = Date.now();
 
-    // 1. Check existing IP ban status
     const rep = this.getReputation(ip);
     if (rep.bannedUntil > now) {
       return { allowed: false, reason: "IP_BANNED", score: rep.score };
     }
 
-    // 2. Consume token bucket
     const bucket = this.getBucket(ip, now);
     if (bucket.tokens >= 1) {
       bucket.tokens -= 1;
       return { allowed: true, tokensRemaining: Math.floor(bucket.tokens), score: rep.score };
     }
 
-    // 3. Rate limit exceeded: penalize IP reputation
     this.penalize(ip, 10, "RATE_LIMIT_EXCEEDED");
     return { allowed: false, reason: "RATE_LIMITED", score: rep.score };
   }
 
-  /**
-   * Calculates and refills token balance for an IP address.
-   */
-  getBucket(ip, now) {
+  private getBucket(ip: string, now: number): Bucket {
     if (!this.buckets.has(ip)) {
       this.buckets.set(ip, { tokens: this.capacity, lastRefill: now });
     }
 
-    const bucket = this.buckets.get(ip);
+    const bucket = this.buckets.get(ip)!;
     const timePassedSec = (now - bucket.lastRefill) / 1000;
-    
-    // Refill tokens based on elapsed time
+
     bucket.tokens = Math.min(this.capacity, bucket.tokens + timePassedSec * this.refillRate);
     bucket.lastRefill = now;
-    
+
     return bucket;
   }
 
-  /**
-   * Retrieves or initializes IP reputation score (default: 100).
-   */
-  getReputation(ip) {
+  public getReputation(ip: string): Reputation {
     if (!this.reputation.has(ip)) {
       this.reputation.set(ip, { score: 100, bannedUntil: 0 });
     }
-    return this.reputation.get(ip);
+    return this.reputation.get(ip)!;
   }
 
-  /**
-   * Deducts points from an IP and triggers auto-bans if score drops below threshold.
-   */
-  penalize(ip, points, reason) {
+  public penalize(ip: string, points: number, reason: string): void {
     const rep = this.getReputation(ip);
     rep.score = Math.max(0, rep.score - points);
 
@@ -75,10 +89,7 @@ export class SecurityManager {
     }
   }
 
-  /**
-   * Returns current statistics for telemetry endpoints (Port 9091).
-   */
-  getMetrics() {
+  public getMetrics(): { trackedIPs: number; activeBans: number } {
     const now = Date.now();
     let bannedCount = 0;
 

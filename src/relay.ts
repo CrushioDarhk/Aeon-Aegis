@@ -227,15 +227,23 @@ export async function startRelayNode() {
 
   // Zero-trust stream handler with active SecurityManager rate limiting
   node.handle(AEON_RELAY_PROTOCOL, (stream, connection) => {
-    // Extract peer IP address from libp2p multiaddr connection
+   // Extract peer IP address safely without triggering strict Multiaddr TS interface errors
     let remoteIP = '127.0.0.1';
     try {
-      const nodeAddr = connection.remoteAddr.nodeAddress();
-      remoteIP = nodeAddr.address;
+      const rawAddr = connection.remoteAddr as any;
+      if (typeof rawAddr.nodeAddress === 'function') {
+        remoteIP = rawAddr.nodeAddress().address || '127.0.0.1';
+      } else {
+        const parts = connection.remoteAddr.toString().split('/');
+        const ipIdx = parts.findIndex((p) => p === 'ip4' || p === 'ip6');
+        if (ipIdx !== -1 && parts[ipIdx + 1]) {
+          remoteIP = parts[ipIdx + 1];
+        }
+      }
     } catch {
-      remoteIP = connection.remoteAddr.toString().split('/')[2] || '127.0.0.1';
+      remoteIP = '127.0.0.1';
     }
-
+    
     // Rate Limiting & Ban-list evaluation
     const check = security.isAllowed(remoteIP);
     if (!check.allowed) {
