@@ -2,8 +2,8 @@
 version: "2.0"
 
 services:
-  aeon-relay:
-    image: crushiodarhk/aeon-aegis:latest
+  relay:
+    image: ghcr.io/<Aeon-Aegis-Network>/aeon-aegis:latest
     expose:
       - port: 9090
         as: 9090
